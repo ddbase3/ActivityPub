@@ -9,10 +9,8 @@ use ActivityPub\Api\IActivityPubKeyService;
 
 /**
  * ActivityPub Inbox endpoint.
- * Receives incoming activities (Follow only for now).
- *
- * Public accounts (users.isPrivate = 0): auto-accept follows and send signed Accept.
- * Private accounts (users.isPrivate = 1): store as pending (accepted=0), no Accept.
+ * GET: Returns an OrderedCollection (usually empty or with received activities).
+ * POST: Receives incoming activities (currently Follow only).
  */
 final class ActivityPubInbox implements IActivityPubEndpoint {
 
@@ -27,9 +25,11 @@ final class ActivityPubInbox implements IActivityPubEndpoint {
 	}
 
 	public function getOutput(): string {
-		// ---- determine local actor name from path ----
+		$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+		$path   = $_SERVER['REQUEST_URI'] ?? '';
+
+		// determine local actor name from path (/users/<name>/inbox)
 		$actorName = null;
-		$path = $_SERVER['REQUEST_URI'] ?? '';
 		if (preg_match('#^/users/([^/?]+)/inbox#', $path, $m)) {
 			$actorName = $m[1];
 		}
@@ -38,6 +38,21 @@ final class ActivityPubInbox implements IActivityPubEndpoint {
 			return json_encode(['error' => 'Missing actor name']);
 		}
 
+		// ---- GET: return OrderedCollection (like Mastodon/Pixelfed) ----
+		if ($method === 'GET') {
+			$domain = $_SERVER['SERVER_NAME'];
+			$inboxUrl = "https://$domain/users/$actorName/inbox";
+
+			return json_encode([
+				'@context' => 'https://www.w3.org/ns/activitystreams',
+				'id' => $inboxUrl,
+				'type' => 'OrderedCollection',
+				'totalItems' => 0,
+				'orderedItems' => []
+			], JSON_UNESCAPED_SLASHES);
+		}
+
+		// ---- POST: process incoming activities ----
 		$input = file_get_contents("php://input") ?: '';
 		if ($input === '') {
 			header('HTTP/1.0 400 Bad Request');
@@ -50,7 +65,7 @@ final class ActivityPubInbox implements IActivityPubEndpoint {
 			return json_encode(['error' => 'Invalid JSON']);
 		}
 
-		// ---- Handle Follow only (for now) ----
+		// ---- handle Follow activity ----
 		if (($activity['type'] ?? '') === 'Follow') {
 			$remoteActorUri = $activity['actor'] ?? null;
 			if (!$remoteActorUri) {
@@ -60,7 +75,7 @@ final class ActivityPubInbox implements IActivityPubEndpoint {
 
 			$this->logger->info("Inbox($actorName): Follow from $remoteActorUri", ['scope' => 'ActivityPub']);
 
-			// local actor + privacy
+			// load local actor from DB
 			$this->database->connect();
 			$actorNameEsc = $this->database->escape($actorName);
 			$localActor = $this->database->singleQuery("
@@ -77,10 +92,10 @@ final class ActivityPubInbox implements IActivityPubEndpoint {
 			$localActorUri = $localActor['uri'];
 			$isPrivate     = (int)($localActor['isPrivate'] ?? 0);
 
-			// ensure remote actor in DB (fetch details incl. inbox/sharedInbox)
+			// ensure remote actor exists in DB
 			[$remoteActorId, $remoteActorDoc] = $this->ensureRemoteActor($remoteActorUri, wantDoc: true);
 
-			// store follower relation (accepted depends on privacy)
+			// store follower relation
 			$remoteId = (int)$remoteActorId;
 			$accepted = $isPrivate ? 0 : 1;
 			$this->database->nonQuery("
@@ -88,11 +103,9 @@ final class ActivityPubInbox implements IActivityPubEndpoint {
 				VALUES ($remoteId, $localActorId, $accepted)
 			");
 
-			// auto-accept if public
+			// auto-accept if public account
 			if ($isPrivate === 0) {
 				$domain = $_SERVER['SERVER_NAME'];
-
-				// Prefer referencing original Follow id; fallback to full activity
 				$acceptObject = $activity['id'] ?? $activity;
 
 				$accept = [
@@ -104,7 +117,7 @@ final class ActivityPubInbox implements IActivityPubEndpoint {
 					'to'       => [$remoteActorUri]
 				];
 
-				// discover inbox (prefer actor.inbox; fallback endpoints.sharedInbox)
+				// discover inbox of remote actor
 				$inboxUrl = $remoteActorDoc['inbox'] ?? null;
 				if (!$inboxUrl && isset($remoteActorDoc['endpoints']['sharedInbox'])) {
 					$inboxUrl = $remoteActorDoc['endpoints']['sharedInbox'];
@@ -123,12 +136,12 @@ final class ActivityPubInbox implements IActivityPubEndpoint {
 			return json_encode(['status' => 'ok']);
 		}
 
-		// ignore other activity types for now
+		// ---- ignore other activity types ----
 		return json_encode(['status' => 'ignored']);
 	}
 
 	/**
-	 * Fetch remote actor; ensure DB row exists.
+	 * Ensure remote actor exists in DB.
 	 * @return array [remoteActorId, remoteActorDoc]
 	 */
 	private function ensureRemoteActor(string $uri, bool $wantDoc = false): array {
@@ -144,16 +157,13 @@ final class ActivityPubInbox implements IActivityPubEndpoint {
 			return [(int)$row['id'], $doc ?? []];
 		}
 
-		// fetch document with correct Accept header
+		// fetch remote actor document
 		$doc = $this->fetchActorDocument($uri);
 
 		$inbox = $doc['inbox'] ?? '';
 		$outbox = $doc['outbox'] ?? '';
 		$type = $doc['type'] ?? 'Person';
-		$publicKey = '';
-		if (isset($doc['publicKey']['publicKeyPem'])) {
-			$publicKey = $doc['publicKey']['publicKeyPem'];
-		}
+		$publicKey = $doc['publicKey']['publicKeyPem'] ?? '';
 
 		$inboxEsc  = $this->database->escape((string)$inbox);
 		$outboxEsc = $this->database->escape((string)$outbox);
@@ -170,7 +180,7 @@ final class ActivityPubInbox implements IActivityPubEndpoint {
 	}
 
 	/**
-	 * Fetch an actor document with proper Accept header.
+	 * Fetch remote actor document with correct Accept header.
 	 */
 	private function fetchActorDocument(string $uri): array {
 		$ch = curl_init($uri);
@@ -196,8 +206,6 @@ final class ActivityPubInbox implements IActivityPubEndpoint {
 
 	/**
 	 * POST JSON body to $url with HTTP Signature.
-	 * Signs headers: (request-target) host date digest content-type
-	 * Returns true on 2xx, false otherwise. Logs details on failure.
 	 */
 	private function postSigned(string $actorName, string $url, array $body): bool {
 		$domain = $_SERVER['SERVER_NAME'];
@@ -205,7 +213,6 @@ final class ActivityPubInbox implements IActivityPubEndpoint {
 		$privateKeyPem = $this->keyService->getPrivateKeyPem($actorName);
 
 		$bodyJson = json_encode($body, JSON_UNESCAPED_SLASHES);
-
 		$date  = gmdate('D, d M Y H:i:s T');
 		$digest = 'SHA-256=' . base64_encode(hash('sha256', $bodyJson, true));
 		$host = parse_url($url, PHP_URL_HOST) ?: '';

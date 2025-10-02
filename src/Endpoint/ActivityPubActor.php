@@ -84,7 +84,8 @@ final class ActivityPubActor implements IActivityPubEndpoint {
 
 		$this->logger->info("Serving ActivityPub actor $actorUrl", ['scope' => 'ActivityPub']);
 
-		return json_encode([
+		// ---- build actor document ----
+		$actor = [
 			'@context' => [
 				"https://w3id.org/security/v1",
 				"https://www.w3.org/ns/activitystreams",
@@ -102,13 +103,14 @@ final class ActivityPubActor implements IActivityPubEndpoint {
 			'preferredUsername' => $actorName,
 			'name' => ucfirst($actorName),
 			'summary' => $summary,
-			'url' => "https://$domain/$actorName",
+			'url' => "https://$domain/@$actorName", // human profile page
 			'inbox' => $inboxUrl,
 			'outbox' => $outboxUrl,
 			'followers' => $followersUrl,
 			'following' => $followingUrl,
 			'published' => $published,
 			'manuallyApprovesFollowers' => $manuallyApprovesFollowers,
+			'indexable' => false,
 			'publicKey' => [
 				'id' => $actorUrl . '#main-key',
 				'owner' => $actorUrl,
@@ -118,11 +120,31 @@ final class ActivityPubActor implements IActivityPubEndpoint {
 				'type' => 'Image',
 				'mediaType' => 'image/png',
 				'url' => $avatarUrl
-			],
-			'endpoints' => [
-				'sharedInbox' => "https://$domain/inbox"
 			]
-		], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+		];
+
+		// optional sharedInbox (only if globally implemented)
+		$sharedInbox = "https://$domain/ap/inbox";
+		if ($this->endpointExists($sharedInbox)) {
+			$actor['endpoints'] = ['sharedInbox' => $sharedInbox];
+		}
+
+		return json_encode($actor, JSON_UNESCAPED_SLASHES);
+	}
+
+	/**
+	 * Helper: check if a global endpoint exists
+	 */
+	private function endpointExists(string $url): bool {
+		// lightweight HEAD request
+		$ch = curl_init($url);
+		curl_setopt($ch, CURLOPT_NOBODY, true);
+		curl_setopt($ch, CURLOPT_TIMEOUT, 2);
+		curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+		$ok = curl_exec($ch) !== false;
+		$code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		curl_close($ch);
+		return $ok && $code >= 200 && $code < 400;
 	}
 }
 
