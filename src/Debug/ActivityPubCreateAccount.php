@@ -26,7 +26,7 @@ final class ActivityPubCreateAccount implements IOutput {
 		return 'activitypubcreateaccount';
 	}
 
-	public function getOutput($out = "json") {
+	public function getOutput(string $out = 'html', bool $final = false): string {
 		$username = trim((string)($this->request->get('username') ?? ''));
 		$email    = trim((string)($this->request->get('email') ?? ''));
 		$password = trim((string)($this->request->get('password') ?? ''));
@@ -88,8 +88,7 @@ final class ActivityPubCreateAccount implements IOutput {
 		}
 	}
 
-	public function getHelp() {
+	public function getHelp(): string {
 		return 'Creates a new local ActivityPub account. Params: username, email, password. Also inserts a first post with an image.';
 	}
 }
-
